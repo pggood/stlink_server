@@ -51,6 +51,11 @@ This open-source reimplementation resolves these problems by:
 4. **Run the Executable**:
    - The executable will be located in the `Debug` or `Release` folder (e.g., `x64/Debug/stlink_server.exe`).
    - Ensure your ST-Link probe is connected before running.
+   - update the registry location to the updated version
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\STMicroelectronics\stlink_server\InstallDir]
+@="C:\\ST\\stlink_server\\stlinkserver.exe"
 
 ## Usage
 
@@ -77,7 +82,9 @@ This open-source reimplementation resolves these problems by:
 
 3. **Hotplug Support**:
    - The server automatically detects ST-Link probe connections and disconnections, logging events to the console.
-   - No reinstallation is required after Windows updates or device reconnections.
+   - No reinstallation is required after Windows updates or device reconnections.  
+   - you can manually run it in debug mode to check if its detecting the STLINK
+     stlinkserver.exe --debug 5
 
 ## Project Structure
 
