@@ -1,19 +1,17 @@
 #define WIN32_LEAN_AND_MEAN
 #define _CRT_SECURE_NO_WARNINGS
+#include <windows.h>
+#undef min
+#undef max
 #include "stlink_server.h"
 #include <iostream>
 #include <string>
-#include <windows.h>
 #include <dbt.h>
 #include <filesystem>
 #include <vector>
 #include <regex>
 #include <sstream>
 #include <algorithm>
-
-// Undefine min/max macros to avoid conflict with std::min
-#undef min
-#undef max
 
 using std::cout;
 using std::cerr;
@@ -41,7 +39,6 @@ bool compare_versions(const string& v1, const string& v2) {
     std::stringstream ss1(v1), ss2(v2);
     string part;
 
-    // Parse version string v1
     while (std::getline(ss1, part, '.')) {
         try {
             if (part.empty() || part.find_first_not_of("0123456789") != string::npos) {
@@ -56,7 +53,6 @@ bool compare_versions(const string& v1, const string& v2) {
         }
     }
 
-    // Parse version string v2
     while (std::getline(ss2, part, '.')) {
         try {
             if (part.empty() || part.find_first_not_of("0123456789") != string::npos) {
@@ -71,7 +67,6 @@ bool compare_versions(const string& v1, const string& v2) {
         }
     }
 
-    // If both version parts are empty, consider them equal
     if (v1_parts.empty() && v2_parts.empty()) {
         return false;
     }
@@ -89,55 +84,77 @@ string find_latest_gdb_server() {
     string latest_path;
     string latest_version;
 
-    for (char drive = 'C'; drive <= 'Z'; drive++) {
-        string drive_path = string(1, drive) + ":\\ST";
-        if (!std::filesystem::exists(drive_path)) continue;
+    log_message("Searching for ST-LINK_gdbserver.exe...");
+    try {
+        for (char drive = 'C'; drive <= 'Z'; drive++) {
+            string drive_path = string(1, drive) + ":\\ST";
+            if (!std::filesystem::exists(drive_path)) continue;
 
-        for (const auto& entry : std::filesystem::directory_iterator(drive_path)) {
-            if (!entry.is_directory()) continue;
-            string dir_name = entry.path().filename().string();
+            for (const auto& entry : std::filesystem::directory_iterator(drive_path)) {
+                if (!entry.is_directory()) continue;
+                string dir_name = entry.path().filename().string();
 
-            std::regex version_regex(R"(STM32CubeIDE_([\d.]+))");
-            std::smatch match;
-            if (std::regex_match(dir_name, match, version_regex)) {
-                string version = match[1].str();
+                std::regex version_regex(R"(STM32CubeIDE_([\d.]+))");
+                std::smatch match;
+                if (std::regex_match(dir_name, match, version_regex)) {
+                    string version = match[1].str();
 
-                if (latest_version.empty() || compare_versions(version, latest_version)) {
-                    string plugins_path = entry.path().string() + "\\STM32CubeIDE\\plugins";
-                    for (const auto& plugin : std::filesystem::recursive_directory_iterator(plugins_path)) {
-                        if (plugin.path().filename() == "ST-LINK_gdbserver.exe") {
-                            latest_path = plugin.path().string();
-                            latest_version = version;
-                            break;
+                    if (latest_version.empty() || compare_versions(version, latest_version)) {
+                        string plugins_path = entry.path().string() + "\\STM32CubeIDE\\plugins";
+                        for (const auto& plugin : std::filesystem::recursive_directory_iterator(plugins_path)) {
+                            if (plugin.path().filename() == "ST-LINK_gdbserver.exe") {
+                                latest_path = plugin.path().string();
+                                latest_version = version;
+                                log_message("Found ST-LINK_gdbserver.exe: " + latest_path + " (version " + version + ")");
+                                break;
+                            }
                         }
                     }
                 }
             }
         }
     }
-
-    if (!latest_path.empty()) {
-        log_message("Found latest ST-LINK_gdbserver.exe: " + latest_path);
+    catch (const std::filesystem::filesystem_error& e) {
+        log_error("Filesystem error in find_latest_gdb_server: " + string(e.what()));
     }
-    else {
+    catch (const std::exception& e) {
+        log_error("Exception in find_latest_gdb_server: " + string(e.what()));
+    }
+    catch (...) {
+        log_error("Unknown exception in find_latest_gdb_server");
+    }
+
+    if (latest_path.empty()) {
         log_error("No ST-LINK_gdbserver.exe found on any drive");
     }
     return latest_path;
 }
 
 string get_cubeprogrammer_path(const string& gdb_server_path) {
-    std::filesystem::path gdb_path(gdb_server_path);
-    auto parent = gdb_path.parent_path().parent_path().parent_path().parent_path();
-    string plugins_path = parent.string();
+    log_message("Entering get_cubeprogrammer_path for: " + gdb_server_path);
+    try {
+        std::filesystem::path gdb_path(gdb_server_path);
+        auto parent = gdb_path.parent_path().parent_path().parent_path().parent_path();
+        string plugins_path = parent.string();
 
-    for (const auto& entry : std::filesystem::directory_iterator(plugins_path)) {
-        if (entry.path().filename().string().find("cubeprogrammer") != string::npos) {
-            string cp_path = entry.path().string() + "\\tools\\bin";
-            log_message("Found CubeProgrammer path: " + cp_path);
-            return cp_path;
+        for (const auto& entry : std::filesystem::directory_iterator(plugins_path)) {
+            if (entry.path().filename().string().find("cubeprogrammer") != string::npos) {
+                string cp_path = entry.path().string() + "\\tools\\bin";
+                log_message("Found CubeProgrammer path: " + cp_path);
+                return cp_path;
+            }
         }
+        log_error("Could not find CubeProgrammer path");
     }
-    log_error("Could not find CubeProgrammer path");
+    catch (const std::filesystem::filesystem_error& e) {
+        log_error("Filesystem error in get_cubeprogrammer_path: " + string(e.what()));
+    }
+    catch (const std::exception& e) {
+        log_error("Exception in get_cubeprogrammer_path: " + string(e.what()));
+    }
+    catch (...) {
+        log_error("Unknown exception in get_cubeprogrammer_path");
+    }
     return "";
 }
 
@@ -146,50 +163,83 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static string gdb_server_path;
     static string cubeprogrammer_path;
 
-    if (msg == WM_CREATE) {
-        server = reinterpret_cast<STLinkServer*>(reinterpret_cast<CREATESTRUCT*>(lParam)->lpCreateParams);
-        gdb_server_path = find_latest_gdb_server();
-        if (!gdb_server_path.empty()) {
-            cubeprogrammer_path = get_cubeprogrammer_path(gdb_server_path);
-        }
-    }
-    if (msg == WM_DEVICECHANGE) {
-        if (wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE) {
-            bool arrived = (wParam == DBT_DEVICEARRIVAL);
-            if (server) {
-                int res = server->handle_hotplug(arrived);
-                log_message(arrived ? "Device arrival detected" : "Device removal detected");
-                if (res != 0) {
-                    log_error("Hotplug handling failed", res);
-                }
-                if (arrived && !gdb_server_path.empty() && !cubeprogrammer_path.empty()) {
-                    string cmd = "\"" + gdb_server_path + "\" -p 61234 -l 1 -d -s -cp \"" + cubeprogrammer_path + "\" -m 0 -k";
-                    log_message("Executing: " + cmd);
+    log_message("WndProc received message: " + std::to_string(msg) + " (wParam: " + std::to_string(wParam) + ")");
 
-                    std::wstring wcmd(cmd.begin(), cmd.end());
-                    STARTUPINFOW si = { sizeof(si) };
-                    PROCESS_INFORMATION pi;
-                    if (CreateProcessW(NULL, wcmd.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-                        CloseHandle(pi.hProcess);
-                        CloseHandle(pi.hThread);
-                        log_message("ST-LINK_gdbserver started successfully");
+    try {
+        if (msg == WM_CREATE) {
+            log_message("Processing WM_CREATE");
+            server = reinterpret_cast<STLinkServer*>(reinterpret_cast<CREATESTRUCT*>(lParam)->lpCreateParams);
+            gdb_server_path = find_latest_gdb_server();
+            if (!gdb_server_path.empty()) {
+                cubeprogrammer_path = get_cubeprogrammer_path(gdb_server_path);
+            }
+            log_message("Completed WM_CREATE processing");
+        }
+        else if (msg == WM_DEVICECHANGE) {
+            log_message("Processing WM_DEVICECHANGE, wParam: " + std::to_string(wParam));
+            if (wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE) {
+                bool arrived = (wParam == DBT_DEVICEARRIVAL);
+                if (server) {
+                    int res = server->handle_hotplug(arrived);
+                    log_message(arrived ? "Device arrival detected" : "Device removal detected");
+                    if (res != 0) {
+                        log_error("Hotplug handling failed", res);
                     }
-                    else {
-                        log_error("Failed to execute ST-LINK_gdbserver", GetLastError());
+                    if (arrived && !gdb_server_path.empty() && !cubeprogrammer_path.empty()) {
+                        string cmd = "\"" + gdb_server_path + "\" -p 61234 -l 1 -d -s -cp \"" + cubeprogrammer_path + "\" -m 0 -k";
+                        log_message("Executing: " + cmd);
+
+                        std::wstring wcmd(cmd.begin(), cmd.end());
+                        STARTUPINFOW si = { sizeof(si) };
+                        PROCESS_INFORMATION pi;
+                        if (CreateProcessW(NULL, wcmd.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
+                            CloseHandle(pi.hProcess);
+                            CloseHandle(pi.hThread);
+                            log_message("ST-LINK_gdbserver started successfully");
+                        }
+                        else {
+                            log_error("Failed to execute ST-LINK_gdbserver", GetLastError());
+                        }
                     }
                 }
             }
         }
+        else if (msg == WM_QUIT) {
+            log_message("Processing WM_QUIT");
+            return 0;
+        }
+        else if (msg == WM_DESTROY) {
+            log_message("Processing WM_DESTROY");
+            PostQuitMessage(0);
+            return 0;
+        }
     }
-    return DefWindowProc(hwnd, msg, wParam, lParam);
+    catch (const std::exception& e) {
+        log_error("Exception in WndProc: " + string(e.what()));
+        PostQuitMessage(1);
+        return 0;
+    }
+    catch (...) {
+        log_error("Unknown exception in WndProc");
+        PostQuitMessage(1);
+        return 0;
+    }
+
+    LRESULT result = DefWindowProc(hwnd, msg, wParam, lParam);
+    log_message("DefWindowProc returned: " + std::to_string(result));
+    return result;
 }
 
 HWND setup_device_notifications(STLinkServer& server) {
+    log_message("Setting up device notifications...");
     WNDCLASS wc = { 0 };
     wc.lpfnWndProc = WndProc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.lpszClassName = L"STLinkDeviceWindow";
-    RegisterClass(&wc);
+    if (!RegisterClass(&wc)) {
+        log_error("Failed to register window class", GetLastError());
+        return nullptr;
+    }
 
     HWND hwnd = CreateWindow(L"STLinkDeviceWindow", L"STLink Device Window", 0, 0, 0, 0, 0,
         HWND_MESSAGE, NULL, GetModuleHandle(NULL), &server);
@@ -208,6 +258,7 @@ HWND setup_device_notifications(STLinkServer& server) {
         DestroyWindow(hwnd);
         return nullptr;
     }
+    log_message("Device notifications set up successfully");
     return hwnd;
 }
 
@@ -278,7 +329,9 @@ int main(int argc, char* argv[]) {
 
     try {
         log_message("Starting STLink Server...");
+        log_message("Creating STLinkServer instance with port=" + std::to_string(port) + ", debug_level=" + std::to_string(debug_level));
         STLinkServer server(port, auto_exit, log_file_path);
+        log_message("STLinkServer instance created successfully");
 
         HWND hwnd = setup_device_notifications(server);
         if (!hwnd) {
@@ -286,6 +339,7 @@ int main(int argc, char* argv[]) {
             return 1;
         }
 
+        log_message("Starting server with debug level " + std::to_string(debug_level));
         int res = server.start(debug_level);
         if (res != 0) {
             log_error("Failed to start server", res);
@@ -295,17 +349,30 @@ int main(int argc, char* argv[]) {
         log_message("STLink Server started successfully");
 
         MSG msg;
-        while (GetMessage(&msg, NULL, 0, 0)) {
+        BOOL ret;
+        while ((ret = GetMessage(&msg, NULL, 0, 0)) != 0) {
+            if (ret == -1) {
+                log_error("GetMessage failed", GetLastError());
+                DestroyWindow(hwnd);
+                return 1;
+            }
+            log_message("GetMessage received message: " + std::to_string(msg.message) + " (wParam: " + std::to_string(msg.wParam) + ")");
             TranslateMessage(&msg);
+            log_message("Dispatching message: " + std::to_string(msg.message));
             DispatchMessage(&msg);
+            log_message("Dispatched message: " + std::to_string(msg.message));
         }
-
+        log_message("GetMessage returned 0, exiting message loop");
         log_message("Exiting...");
         DestroyWindow(hwnd);
         return 0;
     }
     catch (const std::exception& e) {
-        log_error("Exception: " + string(e.what()));
+        log_error("Exception in main: " + string(e.what()));
+        return 1;
+    }
+    catch (...) {
+        log_error("Unknown exception in main");
         return 1;
     }
 }

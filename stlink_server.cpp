@@ -23,7 +23,7 @@ STLinkServer::STLinkServer(int port, bool auto_exit, const std::string& log_file
     auto_exit(auto_exit) {
     WSADATA wsaData;
     if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-        throw std::runtime_error("WSAStartup failed");
+        throw std::runtime_error("WSAStartup failed with error: " + std::to_string(WSAGetLastError()));
     }
     if (!log_file_path.empty()) {
         log_file.open(log_file_path, std::ios::out | std::ios::app);
@@ -105,10 +105,7 @@ void STLinkServer::stlk_log(const char* format, ...) {
 }
 
 int STLinkServer::create_listening_sockets() {
-    debug_log(1, "create_listening_sockets");
-    debug_log(2, "Entering create_listening_sockets()");
-    debug_log(3, "Creating the list of sockets to listen for ...");
-
+    debug_log(1, "Entering create_listening_sockets()");
     struct addrinfo hints = { 0 };
     struct addrinfo* result = NULL;
     int iResult;
@@ -125,24 +122,20 @@ int STLinkServer::create_listening_sockets() {
 
     iResult = getaddrinfo(NULL, port_str, &hints, &result);
     if (iResult != 0) {
+        debug_log(1, "getaddrinfo failed with error: %d", iResult);
         return -1;
     }
 
-    debug_log(6, "getaddrinfo successful. Enumerating the returned addresses ...");
-
     for (struct addrinfo* ptr = result; ptr != NULL; ptr = ptr->ai_next) {
-        debug_log(7, "Processing Address %p returned by getaddrinfo(%d) : (null)",
-            ptr, (ptr == result ? 1 : 2));
-
         server_socket = socket(ptr->ai_family, ptr->ai_socktype, ptr->ai_protocol);
         if (server_socket == INVALID_SOCKET) {
+            debug_log(1, "socket creation failed with error: %d", WSAGetLastError());
             continue;
         }
 
-        debug_log(8, "Created socket with handle = %d", server_socket);
-
         iResult = bind(server_socket, ptr->ai_addr, (int)ptr->ai_addrlen);
         if (iResult == SOCKET_ERROR) {
+            debug_log(1, "bind failed with error: %d", WSAGetLastError());
             closesocket(server_socket);
             server_socket = INVALID_SOCKET;
             continue;
@@ -161,36 +154,32 @@ int STLinkServer::create_listening_sockets() {
         inet_ntop(ptr->ai_family, addr, ipstr, sizeof(ipstr));
         info_log("%s:%s", ipstr, port_str);
 
-        debug_log(10, "Socket bound successfully");
-
         u_long iMode = 1;
         iResult = ioctlsocket(server_socket, FIONBIO, &iMode);
         if (iResult != NO_ERROR) {
+            debug_log(1, "ioctlsocket failed with error: %d", iResult);
             closesocket(server_socket);
             server_socket = INVALID_SOCKET;
             continue;
         }
 
-        debug_log(11, "Non Blocking Setting");
-        debug_log(12, "alloc_init_sock_info : Allocated %p", (void*)server_socket);
-        debug_log(13, "Added socket to list of listening sockets");
         break;
     }
 
     freeaddrinfo(result);
-    debug_log(14, "Freed the memory allocated for res by getaddrinfo");
-
     if (server_socket == INVALID_SOCKET) {
+        debug_log(1, "No valid socket created");
         return -1;
     }
 
     if (listen(server_socket, SOMAXCONN) == SOCKET_ERROR) {
+        debug_log(1, "listen failed with error: %d", WSAGetLastError());
         closesocket(server_socket);
         server_socket = INVALID_SOCKET;
         return -1;
     }
 
-    debug_log(15, "Exiting create_listening_sockets()");
+    debug_log(1, "create_listening_sockets completed successfully");
     return 0;
 }
 
@@ -207,6 +196,7 @@ std::string STLinkServer::extract_serial_number(const WCHAR* device_path) {
 }
 
 int STLinkServer::usb_init() {
+    debug_log(1, "Entering usb_init");
     GUID winusb_guid = { 0xA5DCBF10, 0x6530, 0x11D2, {0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED} };
     HDEVINFO device_info = SetupDiGetClassDevs(&winusb_guid, NULL, NULL, DIGCF_DEVICEINTERFACE | DIGCF_PRESENT);
     if (device_info == INVALID_HANDLE_VALUE) {
@@ -224,7 +214,7 @@ int STLinkServer::usb_init() {
 
         PSP_DEVICE_INTERFACE_DETAIL_DATA detail = (PSP_DEVICE_INTERFACE_DETAIL_DATA)malloc(required_size);
         if (!detail) {
-            debug_log(2, "Memory allocation failed");
+            debug_log(1, "Memory allocation failed for device interface detail");
             SetupDiDestroyDeviceInfoList(device_info);
             return -1;
         }
@@ -234,6 +224,7 @@ int STLinkServer::usb_init() {
 
         if (SetupDiGetDeviceInterfaceDetail(device_info, &interface_data, detail, required_size, NULL, &devinfo_data)) {
             if (wcsstr(detail->DevicePath, L"vid_0483") && wcsstr(detail->DevicePath, L"pid_3748")) {
+                debug_log(2, "Found STLink device with VID=0483, PID=3748");
                 device_handle = CreateFile(detail->DevicePath,
                     GENERIC_READ | GENERIC_WRITE,
                     FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -282,19 +273,19 @@ int STLinkServer::usb_init() {
                                     break;
                                 }
                                 else {
-                                    debug_log(6, "Communication test failed: 0x%08x", GetLastError());
+                                    debug_log(1, "Communication test failed: 0x%08x", GetLastError());
                                 }
                             }
                             else {
-                                debug_log(7, "Missing required endpoints");
+                                debug_log(1, "Missing required endpoints");
                             }
                         }
                         else {
-                            debug_log(8, "QueryInterfaceSettings failed: 0x%08x", GetLastError());
+                            debug_log(1, "QueryInterfaceSettings failed: 0x%08x", GetLastError());
                         }
                     }
                     else {
-                        debug_log(9, "WinUsb_Initialize failed: 0x%08x", GetLastError());
+                        debug_log(1, "WinUsb_Initialize failed: 0x%08x", GetLastError());
                     }
 
                     if (!stlink_found) {
@@ -305,12 +296,12 @@ int STLinkServer::usb_init() {
                     }
                 }
                 else {
-                    debug_log(10, "CreateFile failed: 0x%08x", GetLastError());
+                    debug_log(1, "CreateFile failed: 0x%08x", GetLastError());
                 }
             }
         }
         else {
-            debug_log(11, "SetupDiGetDeviceInterfaceDetail failed: 0x%08x", GetLastError());
+            debug_log(1, "SetupDiGetDeviceInterfaceDetail failed: 0x%08x", GetLastError());
         }
 
         free(detail);
@@ -320,17 +311,16 @@ int STLinkServer::usb_init() {
     SetupDiDestroyDeviceInfoList(device_info);
 
     if (!stlink_found) {
-        debug_log(12, "No working STLink device found");
-        if (winusb_handle) WinUsb_Free(winusb_handle);
-        if (device_handle) CloseHandle(device_handle);
+        debug_log(1, "No working STLink device found");
         return -1;
     }
 
-    debug_log(13, "USB initialization successful for device: %s", serial.c_str());
+    debug_log(1, "USB initialization successful for device: %s", serial.c_str());
     return 0;
 }
 
 int STLinkServer::usb_close() {
+    debug_log(1, "Closing USB device");
     if (winusb_handle) {
         WinUsb_Free(winusb_handle);
         winusb_handle = NULL;
@@ -344,12 +334,14 @@ int STLinkServer::usb_close() {
 }
 
 int STLinkServer::open_debug_interface(DebugInterface& iface) {
+    debug_log(1, "Opening debug interface");
     iface.fw_major_ver = 2;
     iface.fw_jtag_ver = 0x1C;
     return 0;
 }
 
 int STLinkServer::handle_hotplug(bool arrived) {
+    debug_log(1, "Handling hotplug event: %s", arrived ? "arrival" : "removal");
     if (arrived) {
         int res = usb_close();
         if (res != 0) return res;
@@ -364,9 +356,13 @@ int STLinkServer::handle_hotplug(bool arrived) {
 }
 
 int STLinkServer::refresh_devices() {
+    debug_log(1, "Refreshing devices");
     GUID winusb_guid = { 0xA5DCBF10, 0x6530, 0x11D2, {0x90, 0x1F, 0x00, 0xC0, 0x4F, 0xB9, 0x51, 0xED} };
     HDEVINFO device_info = SetupDiGetClassDevs(&winusb_guid, NULL, NULL, DIGCF_DEVICEINTERFACE | DIGCF_PRESENT);
-    if (device_info == INVALID_HANDLE_VALUE) return -1;
+    if (device_info == INVALID_HANDLE_VALUE) {
+        debug_log(1, "SetupDiGetClassDevs failed in refresh_devices: 0x%08x", GetLastError());
+        return -1;
+    }
 
     SP_DEVICE_INTERFACE_DATA interface_data = { sizeof(SP_DEVICE_INTERFACE_DATA) };
     DWORD index = 0;
@@ -386,9 +382,7 @@ int STLinkServer::refresh_devices() {
 }
 
 int STLinkServer::server_loop() {
-    debug_log(18, "non_blocking_accept_main");
-    debug_log(19, "Entering non_blocking_accept_main");
-
+    debug_log(1, "Entering server_loop");
     time_t last_activity = time(NULL);
 
     while (true) {
@@ -403,27 +397,35 @@ int STLinkServer::server_loop() {
         int activity = select(0, &readfds, NULL, NULL, &timeout);
 
         if (activity == SOCKET_ERROR) {
+            debug_log(1, "select failed with error: %d", WSAGetLastError());
             return -1;
         }
 
         if (activity > 0 && FD_ISSET(server_socket, &readfds)) {
+            debug_log(2, "Accepting new client connection");
             SOCKET client_socket = accept(server_socket, NULL, NULL);
             if (client_socket != INVALID_SOCKET) {
                 last_activity = time(NULL);
+                debug_log(2, "Client connected, socket: %d", client_socket);
                 closesocket(client_socket);
+            }
+            else {
+                debug_log(1, "accept failed with error: %d", WSAGetLastError());
             }
         }
 
         if (auto_exit && difftime(time(NULL), last_activity) > 30) {
-            debug_log(20, "No connections/data in the last 30 seconds. Exiting due to auto-exit.");
+            debug_log(1, "No connections/data in the last 30 seconds. Exiting due to auto-exit.");
             return 0;
         }
     }
 
+    debug_log(1, "Exiting server_loop");
     return 0;
 }
 
 int STLinkServer::get_firmware_version(DebugInterface& iface) {
+    debug_log(1, "Getting firmware version");
     uint8_t databuf[32];
     ULONG bytes_transferred;
     WINUSB_SETUP_PACKET setup = {
@@ -436,46 +438,59 @@ int STLinkServer::get_firmware_version(DebugInterface& iface) {
     if (WinUsb_ControlTransfer(winusb_handle, setup, databuf, 32, &bytes_transferred, NULL)) {
         iface.fw_major_ver = databuf[0];
         iface.fw_jtag_ver = databuf[2];
+        debug_log(1, "Firmware version retrieved: v%d.%d", iface.fw_major_ver, iface.fw_jtag_ver);
         return 0;
     }
+    debug_log(1, "WinUsb_ControlTransfer failed: 0x%08x", GetLastError());
     return GetLastError();
 }
 
 int STLinkServer::exit_jtag_mode() {
+    debug_log(1, "Exiting JTAG mode");
     uint8_t cmdbuf[32] = { CMD_ENTER_SWD, 0x21 };
     ULONG bytes_transferred;
     WINUSB_SETUP_PACKET setup = { 0x40, 0, 0, 0, 32 };
     if (WinUsb_ControlTransfer(winusb_handle, setup, cmdbuf, 32, &bytes_transferred, NULL)) {
         return 0;
     }
+    debug_log(1, "WinUsb_ControlTransfer failed: 0x%08x", GetLastError());
     return GetLastError();
 }
 
 int STLinkServer::blink_led() {
+    debug_log(1, "Blinking LED");
     uint8_t cmdbuf[32] = { CMD_ENTER_SWD, 0x49 };
     ULONG bytes_transferred;
     WINUSB_SETUP_PACKET setup = { 0x40, 0, 0, 0, 32 };
     if (WinUsb_ControlTransfer(winusb_handle, setup, cmdbuf, 32, &bytes_transferred, NULL)) {
         return 0;
     }
+    debug_log(1, "WinUsb_ControlTransfer failed: 0x%08x", GetLastError());
     return GetLastError();
 }
 
 int STLinkServer::erase_flash() {
+    debug_log(1, "Erasing flash");
     uint8_t cmdbuf[2] = { CMD_ERASE_FLASH, 0 };
     uint8_t databuf[2];
     ULONG bytes_transferred;
     if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, 2, &bytes_transferred, NULL)) {
+        debug_log(1, "WinUsb_WritePipe failed: 0x%08x", GetLastError());
         return GetLastError();
     }
     if (!WinUsb_ReadPipe(winusb_handle, rx_ep, (PUCHAR)databuf, 2, &bytes_transferred, NULL)) {
+        debug_log(1, "WinUsb_ReadPipe failed: 0x%08x", GetLastError());
         return GetLastError();
     }
     return (bytes_transferred == 2 && databuf[0] == 0x00) ? 0 : -1;
 }
 
 int STLinkServer::write_flash(uint32_t address, uint8_t* data, uint32_t length) {
-    if (length > 0xFFFF) return -1;
+    debug_log(1, "Writing flash at address 0x%08x, length %u", address, length);
+    if (length > 0xFFFF) {
+        debug_log(1, "Flash write length too large: %u", length);
+        return -1;
+    }
     uint8_t cmdbuf[512];
     cmdbuf[0] = CMD_WRITE_MEM;
     memcpy(&cmdbuf[1], &address, 4);
@@ -484,89 +499,109 @@ int STLinkServer::write_flash(uint32_t address, uint8_t* data, uint32_t length) 
     uint8_t databuf[2];
     ULONG bytes_transferred;
     if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, 9 + length, &bytes_transferred, NULL)) {
+        debug_log(1, "WinUsb_WritePipe failed: 0x%08x", GetLastError());
         return GetLastError();
     }
     if (!WinUsb_ReadPipe(winusb_handle, rx_ep, (PUCHAR)databuf, 2, &bytes_transferred, NULL)) {
+        debug_log(1, "WinUsb_ReadPipe failed: 0x%08x", GetLastError());
         return GetLastError();
     }
     return (bytes_transferred == 2 && databuf[0] == 0x00) ? 0 : -1;
 }
 
 int STLinkServer::enter_swd_mode() {
+    debug_log(1, "Entering SWD mode");
     uint8_t cmdbuf[2] = { CMD_ENTER_SWD, 0xA3 };
     uint8_t databuf[2];
     ULONG bytes_transferred;
     if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, 2, &bytes_transferred, NULL)) {
+        debug_log(1, "WinUsb_WritePipe failed: 0x%08x", GetLastError());
         return GetLastError();
     }
     if (!WinUsb_ReadPipe(winusb_handle, rx_ep, (PUCHAR)databuf, 2, &bytes_transferred, NULL)) {
+        debug_log(1, "WinUsb_ReadPipe failed: 0x%08x", GetLastError());
         return GetLastError();
     }
     return (bytes_transferred == 2 && databuf[0] == 0x00) ? 0 : -1;
 }
 
 int STLinkServer::read_register(uint8_t reg_id, uint32_t& value) {
+    debug_log(1, "Reading register %u", reg_id);
     uint8_t cmdbuf[2] = { CMD_READ_REG, reg_id };
     uint8_t databuf[4];
     ULONG bytes_transferred;
     if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, 2, &bytes_transferred, NULL)) {
+        debug_log(1, "WinUsb_WritePipe failed: 0x%08x", GetLastError());
         return GetLastError();
     }
     if (!WinUsb_ReadPipe(winusb_handle, rx_ep, (PUCHAR)databuf, 4, &bytes_transferred, NULL)) {
+        debug_log(1, "WinUsb_ReadPipe failed: 0x%08x", GetLastError());
         return GetLastError();
     }
     if (bytes_transferred == 4 && databuf[0] == 0x00) {
         memcpy(&value, databuf, 4);
         return 0;
     }
+    debug_log(1, "Register read failed: bytes_transferred=%u, databuf[0]=0x%02x", bytes_transferred, databuf[0]);
     return -1;
 }
 
 int STLinkServer::write_register(uint8_t reg_id, uint32_t value) {
+    debug_log(1, "Writing register %u with value 0x%08x", reg_id, value);
     uint8_t cmdbuf[6] = { CMD_WRITE_REG, reg_id };
     memcpy(&cmdbuf[2], &value, 4);
     uint8_t databuf[2];
     ULONG bytes_transferred;
     if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, 6, &bytes_transferred, NULL)) {
+        debug_log(1, "WinUsb_WritePipe failed: 0x%08x", GetLastError());
         return GetLastError();
     }
     if (!WinUsb_ReadPipe(winusb_handle, rx_ep, (PUCHAR)databuf, 2, &bytes_transferred, NULL)) {
+        debug_log(1, "WinUsb_ReadPipe failed: 0x%08x", GetLastError());
         return GetLastError();
     }
     return (bytes_transferred == 2 && databuf[0] == 0x00) ? 0 : -1;
 }
 
 int STLinkServer::read_trace(uint8_t* buffer, uint32_t max_length, uint32_t& read_length) {
+    debug_log(1, "Reading trace with max_length %u", max_length);
     ULONG bytes_transferred;
     if (WinUsb_ReadPipe(winusb_handle, trace_ep, buffer, max_length, &bytes_transferred, NULL)) {
         read_length = bytes_transferred;
+        debug_log(1, "Trace read successful, bytes_transferred: %u", bytes_transferred);
         return 0;
     }
+    debug_log(1, "WinUsb_ReadPipe failed: 0x%08x", GetLastError());
     return GetLastError();
 }
 
 int STLinkServer::start(int debug_level) {
     this->debug_level = debug_level;
+    debug_log(1, "Starting STLinkServer with debug level %d", debug_level);
 
     if (create_listening_sockets() != 0) {
         info_log("Failed to create listening sockets");
         return -1;
     }
+    debug_log(1, "Listening sockets created successfully");
 
     if (usb_init() != 0) {
-        info_log("USB initialization failed - no STLink device found");
-        closesocket(server_socket);
-        return -2;
+        info_log("USB initialization failed - no STLink device found, continuing without device");
+        // Continue instead of exiting
+    }
+    else {
+        debug_log(1, "USB initialization completed");
+        DebugInterface iface;
+        if (get_firmware_version(iface) != 0) {
+            info_log("Failed to communicate with STLink device");
+            usb_close();
+            closesocket(server_socket);
+            return -3;
+        }
+        debug_log(1, "Firmware version check completed");
+        info_log("STLink Server ready - FW v%d.%d", iface.fw_major_ver, iface.fw_jtag_ver);
     }
 
-    DebugInterface iface;
-    if (get_firmware_version(iface) != 0) {
-        info_log("Failed to communicate with STLink device");
-        usb_close();
-        closesocket(server_socket);
-        return -3;
-    }
-
-    info_log("STLink Server ready - FW v%d.%d", iface.fw_major_ver, iface.fw_jtag_ver);
+    debug_log(1, "Proceeding to server loop");
     return server_loop();
 }
