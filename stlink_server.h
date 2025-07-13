@@ -2,6 +2,7 @@
 #define STLINK_SERVER_H
 
 #define WIN32_LEAN_AND_MEAN
+#define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <winusb.h>
 #include <setupapi.h>
@@ -9,6 +10,9 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <string>
+#include <cstdarg>
+#include <regex>
+#include <fstream>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "setupapi.lib")
@@ -36,6 +40,18 @@ private:
     UCHAR rx_ep;                         // Receive endpoint
     UCHAR tx_ep;                         // Transmit endpoint
     UCHAR trace_ep;                      // Trace endpoint
+    int debug_level;                     // Debug verbosity level
+    int debug_counter;                   // Debug message counter
+    int port;                            // TCP listening port
+    bool auto_exit;                      // Auto-exit when no clients
+    std::ofstream log_file;              // Log file stream
+
+    // Private methods
+    std::string extract_serial_number(const WCHAR* device_path);
+    void debug_log(int level, const char* format, ...);
+    void info_log(const char* format, ...);
+    void stlk_log(const char* format, ...);
+    int create_listening_sockets();
 
 public:
     // Nested structure for debug interface
@@ -47,11 +63,11 @@ public:
     };
 
     // Constructor and destructor
-    STLinkServer();
+    STLinkServer(int port = 7184, bool auto_exit = false, const std::string& log_file_path = "");
     ~STLinkServer();
 
     // Public methods
-    int start();
+    int start(int debug_level = 0);
     int usb_init();
     int usb_close();
     int open_debug_interface(DebugInterface& iface);
@@ -70,3 +86,4 @@ public:
 };
 
 #endif
+
