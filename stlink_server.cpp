@@ -444,6 +444,188 @@ int STLinkServer::get_firmware_version(DebugInterface& iface) {
     debug_log(1, "WinUsb_ControlTransfer failed: 0x%08x", GetLastError());
     return GetLastError();
 }
+// Add to stlink_server.cpp
+int STLinkServer::write_flash(uint32_t address, const uint8_t* data, uint32_t length) {
+    debug_log(1, "Writing flash at address 0x%08x, length %u", address, length);
+
+    if (length > 0xFFFF) {
+        debug_log(1, "Flash write length too large: %u", length);
+        return -1;
+    }
+
+    // Check if address is in flash memory range
+    if (address < 0x08000000 || address >= 0x08200000) {
+        debug_log(1, "Invalid flash address: 0x%08x", address);
+        return -1;
+    }
+
+    // Check alignment (STM32 typically requires 32-bit alignment)
+    if ((address % 4) != 0 || (length % 4) != 0) {
+        debug_log(1, "Unaligned flash access: addr=0x%08x, len=%u", address, length);
+        return -1;
+    }
+
+    uint8_t cmdbuf[512];
+    cmdbuf[0] = CMD_WRITE_MEM;
+    memcpy(&cmdbuf[1], &address, 4);
+    memcpy(&cmdbuf[5], &length, 4);
+    memcpy(&cmdbuf[9], data, length);
+
+    uint8_t databuf[2];
+    ULONG bytes_transferred;
+
+    if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, 9 + length, &bytes_transferred, NULL)) {
+        DWORD err = GetLastError();
+        debug_log(1, "WinUsb_WritePipe failed: 0x%08x", err);
+        return err;
+    }
+
+    if (!WinUsb_ReadPipe(winusb_handle, rx_ep, databuf, 2, &bytes_transferred, NULL)) {
+        DWORD err = GetLastError();
+        debug_log(1, "WinUsb_ReadPipe failed: 0x%08x", err);
+        return err;
+    }
+
+    if (bytes_transferred != 2 || databuf[0] != 0x00) {
+        debug_log(1, "Flash write verification failed");
+        return -1;
+    }
+
+    return 0;
+}
+// Add to stlink_server.cpp
+
+int STLinkServer::mass_erase() {
+    debug_log(1, "Performing mass erase");
+    uint8_t cmdbuf[2] = { CMD_MASS_ERASE, 0x00 };
+    uint8_t databuf[2];
+    ULONG bytes_transferred;
+
+    if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, 2, &bytes_transferred, NULL)) {
+        debug_log(1, "Mass erase command failed: 0x%08x", GetLastError());
+        return GetLastError();
+    }
+
+    if (!WinUsb_ReadPipe(winusb_handle, rx_ep, databuf, 2, &bytes_transferred, NULL)) {
+        debug_log(1, "Mass erase response failed: 0x%08x", GetLastError());
+        return GetLastError();
+    }
+
+    if (bytes_transferred != 2 || databuf[0] != 0x00) {
+        debug_log(1, "Mass erase verification failed");
+        return -1;
+    }
+
+    return 0;
+}
+
+int STLinkServer::read_flash(uint32_t address, uint8_t* data, uint32_t length) {
+    debug_log(1, "Reading flash at address 0x%08x, length %u", address, length);
+
+    if (length > 0xFFFF) {
+        debug_log(1, "Flash read length too large: %u", length);
+        return -1;
+    }
+
+    uint8_t cmdbuf[5] = { CMD_READ_MEM };
+    memcpy(&cmdbuf[1], &address, 4);
+
+    ULONG bytes_transferred;
+    if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, 5, &bytes_transferred, NULL)) {
+        debug_log(1, "Flash read command failed: 0x%08x", GetLastError());
+        return GetLastError();
+    }
+
+    if (!WinUsb_ReadPipe(winusb_handle, rx_ep, data, length, &bytes_transferred, NULL)) {
+        debug_log(1, "Flash read data failed: 0x%08x", GetLastError());
+        return GetLastError();
+    }
+
+    if (bytes_transferred != length) {
+        debug_log(1, "Incomplete flash read: expected %u, got %u", length, bytes_transferred);
+        return -1;
+    }
+
+    return 0;
+}
+
+int STLinkServer::program_firmware(const std::vector<uint8_t>& firmware_data, uint32_t base_address) {
+    debug_log(1, "Programming firmware (size: %zu bytes) to address 0x%08x",
+        firmware_data.size(), base_address);
+
+    // Check for size overflow
+    if (firmware_data.size() > UINT32_MAX) {
+        debug_log(1, "Firmware size too large: %zu bytes exceeds UINT32_MAX", firmware_data.size());
+        return -1;
+    }
+
+    // First perform mass erase
+    int res = mass_erase();
+    if (res != 0) {
+        debug_log(1, "Mass erase failed before programming");
+        return res;
+    }
+
+    // Program in chunks (STLink typically handles up to 1024 bytes at a time)
+    const size_t chunk_size = 1024;
+    size_t remaining = firmware_data.size();
+    size_t offset = 0;
+
+    while (remaining > 0) {
+        uint32_t current_chunk = static_cast<uint32_t>((remaining > chunk_size) ? chunk_size : remaining);
+        uint32_t current_address = base_address + static_cast<uint32_t>(offset);
+
+        res = write_flash(current_address, &firmware_data[offset], current_chunk);
+        if (res != 0) {
+            debug_log(1, "Flash write failed at offset 0x%08x", offset);
+            return res;
+        }
+
+        offset += current_chunk;
+        remaining -= current_chunk;
+    }
+
+    return 0;
+}
+
+int STLinkServer::verify_firmware(const std::vector<uint8_t>& firmware_data, uint32_t base_address) {
+    debug_log(1, "Verifying firmware (size: %zu bytes) at address 0x%08x",
+        firmware_data.size(), base_address);
+
+    // Check for size overflow
+    if (firmware_data.size() > UINT32_MAX) {
+        debug_log(1, "Firmware size too large: %zu bytes exceeds UINT32_MAX", firmware_data.size());
+        return -1;
+    }
+
+    // Read back in chunks
+    const size_t chunk_size = 1024;
+    size_t remaining = firmware_data.size();
+    size_t offset = 0;
+    std::vector<uint8_t> read_buffer(chunk_size);
+
+    while (remaining > 0) {
+        uint32_t current_chunk = static_cast<uint32_t>((remaining > chunk_size) ? chunk_size : remaining);
+        uint32_t current_address = base_address + static_cast<uint32_t>(offset);
+
+        int res = read_flash(current_address, read_buffer.data(), current_chunk);
+        if (res != 0) {
+            debug_log(1, "Flash read failed at offset 0x%08x", offset);
+            return res;
+        }
+
+        // Compare with original data
+        if (memcmp(read_buffer.data(), &firmware_data[offset], current_chunk) != 0) {
+            debug_log(1, "Verification failed at offset 0x%08x", offset);
+            return -1;
+        }
+
+        offset += current_chunk;
+        remaining -= current_chunk;
+    }
+
+    return 0;
+}
 
 int STLinkServer::exit_jtag_mode() {
     debug_log(1, "Exiting JTAG mode");
@@ -485,29 +667,6 @@ int STLinkServer::erase_flash() {
     return (bytes_transferred == 2 && databuf[0] == 0x00) ? 0 : -1;
 }
 
-int STLinkServer::write_flash(uint32_t address, uint8_t* data, uint32_t length) {
-    debug_log(1, "Writing flash at address 0x%08x, length %u", address, length);
-    if (length > 0xFFFF) {
-        debug_log(1, "Flash write length too large: %u", length);
-        return -1;
-    }
-    uint8_t cmdbuf[512];
-    cmdbuf[0] = CMD_WRITE_MEM;
-    memcpy(&cmdbuf[1], &address, 4);
-    memcpy(&cmdbuf[5], &length, 4);
-    memcpy(&cmdbuf[9], data, length);
-    uint8_t databuf[2];
-    ULONG bytes_transferred;
-    if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, 9 + length, &bytes_transferred, NULL)) {
-        debug_log(1, "WinUsb_WritePipe failed: 0x%08x", GetLastError());
-        return GetLastError();
-    }
-    if (!WinUsb_ReadPipe(winusb_handle, rx_ep, (PUCHAR)databuf, 2, &bytes_transferred, NULL)) {
-        debug_log(1, "WinUsb_ReadPipe failed: 0x%08x", GetLastError());
-        return GetLastError();
-    }
-    return (bytes_transferred == 2 && databuf[0] == 0x00) ? 0 : -1;
-}
 
 int STLinkServer::enter_swd_mode() {
     debug_log(1, "Entering SWD mode");
@@ -574,7 +733,445 @@ int STLinkServer::read_trace(uint8_t* buffer, uint32_t max_length, uint32_t& rea
     debug_log(1, "WinUsb_ReadPipe failed: 0x%08x", GetLastError());
     return GetLastError();
 }
+// Add to stlink_server.cpp
+int STLinkServer::debug_read_memory(uint32_t address, uint8_t* data, uint32_t length) {
+    if (target_halted) {
+        return read_memory(address, data, length);
+    }
+    else {
+        // For running target, we need to halt first
+        int res = halt_target();
+        if (res != 0) return res;
+        res = read_memory(address, data, length);
+        continue_execution(); // Resume after read
+        return res;
+    }
+}
+int STLinkServer::read_memory(uint32_t address, uint8_t* data, uint32_t length) {
+    debug_log(1, "Reading memory at address 0x%08x, length %u", address, length);
 
+    uint8_t cmdbuf[5] = { CMD_READ_MEM };
+    memcpy(&cmdbuf[1], &address, 4);
+
+    ULONG bytes_transferred;
+    if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, sizeof(cmdbuf), &bytes_transferred, NULL)) {
+        debug_log(1, "Read memory command failed: 0x%08x", GetLastError());
+        return GetLastError();
+    }
+
+    if (!WinUsb_ReadPipe(winusb_handle, rx_ep, data, length, &bytes_transferred, NULL)) {
+        debug_log(1, "Read memory data failed: 0x%08x", GetLastError());
+        return GetLastError();
+    }
+
+    if (bytes_transferred != length) {
+        debug_log(1, "Incomplete memory read: expected %u, got %u", length, bytes_transferred);
+        return -1;
+    }
+
+    return 0;
+}
+
+int STLinkServer::write_memory(uint32_t address, const uint8_t* data, uint32_t length) {
+    debug_log(1, "Writing memory at address 0x%08x, length %u", address, length);
+
+    uint8_t cmdbuf[9] = { CMD_WRITE_MEM };
+    memcpy(&cmdbuf[1], &address, 4);
+    memcpy(&cmdbuf[5], &length, 4);
+
+    ULONG bytes_transferred;
+    if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, sizeof(cmdbuf), &bytes_transferred, NULL)) {
+        debug_log(1, "Write memory command failed: 0x%08x", GetLastError());
+        return GetLastError();
+    }
+
+    if (!WinUsb_WritePipe(winusb_handle, tx_ep, const_cast<PUCHAR>(data), length, &bytes_transferred, NULL)) {
+        debug_log(1, "Write memory data failed: 0x%08x", GetLastError());
+        return GetLastError();
+    }
+
+    uint8_t response[2];
+    if (!WinUsb_ReadPipe(winusb_handle, rx_ep, response, sizeof(response), &bytes_transferred, NULL)) {
+        debug_log(1, "Write memory response failed: 0x%08x", GetLastError());
+        return GetLastError();
+    }
+
+    if (bytes_transferred != 2 || response[0] != 0x00) {
+        debug_log(1, "Memory write verification failed");
+        return -1;
+    }
+
+    return 0;
+}
+int STLinkServer::set_breakpoint(uint32_t address, bool hardware) {
+    debug_log(1, "Setting %s breakpoint at address 0x%08x", hardware ? "hardware" : "software", address);
+
+    if (!hardware) {
+        debug_log(1, "Software breakpoints not supported");
+        return -1; // Software breakpoints require instruction modification, not implemented here
+    }
+
+    // Check if address is in valid flash or RAM range
+    if ((address < 0x08000000 || address >= 0x08200000) && (address < 0x20000000 || address >= 0x20010000)) {
+        debug_log(1, "Invalid breakpoint address: 0x%08x", address);
+        return -1;
+    }
+
+    // Ensure 2-byte alignment for Thumb instructions
+    if (address % 2 != 0) {
+        debug_log(1, "Unaligned breakpoint address: 0x%08x", address);
+        return -1;
+    }
+
+    // Command to set hardware breakpoint (assuming FPB unit for Cortex-M)
+    uint8_t cmdbuf[16];
+    cmdbuf[0] = CMD_SET_BREAKPOINT;
+    cmdbuf[1] = 0x01; // Hardware breakpoint
+    memcpy(&cmdbuf[2], &address, 4);
+
+    ULONG bytes_transferred;
+    if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, 6, &bytes_transferred, NULL)) {
+        DWORD err = GetLastError();
+        debug_log(1, "WinUsb_WritePipe failed for breakpoint: 0x%08x", err);
+        return err;
+    }
+
+    uint8_t response[2];
+    if (!WinUsb_ReadPipe(winusb_handle, rx_ep, response, 2, &bytes_transferred, NULL)) {
+        DWORD err = GetLastError();
+        debug_log(1, "WinUsb_ReadPipe failed for breakpoint: 0x%08x", err);
+        return err;
+    }
+
+    if (bytes_transferred != 2 || response[0] != 0x00) {
+        debug_log(1, "Breakpoint set failed at 0x%08x", address);
+        return -1;
+    }
+
+    return 0;
+}
+
+int STLinkServer::remove_breakpoint(uint32_t address) {
+    debug_log(1, "Removing breakpoint at address 0x%08x", address);
+
+    // Check address validity
+    if ((address < 0x08000000 || address >= 0x08200000) && (address < 0x20000000 || address >= 0x20010000)) {
+        debug_log(1, "Invalid breakpoint address: 0x%08x", address);
+        return -1;
+    }
+
+    // Ensure 2-byte alignment
+    if (address % 2 != 0) {
+        debug_log(1, "Unaligned breakpoint address: 0x%08x", address);
+        return -1;
+    }
+
+    // Command to remove hardware breakpoint
+    uint8_t cmdbuf[16];
+    cmdbuf[0] = CMD_REMOVE_BREAKPOINT;
+    memcpy(&cmdbuf[1], &address, 4);
+
+    ULONG bytes_transferred;
+    if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, 5, &bytes_transferred, NULL)) {
+        DWORD err = GetLastError();
+        debug_log(1, "WinUsb_WritePipe failed for breakpoint removal: 0x%08x", err);
+        return err;
+    }
+
+    uint8_t response[2];
+    if (!WinUsb_ReadPipe(winusb_handle, rx_ep, response, 2, &bytes_transferred, NULL)) {
+        DWORD err = GetLastError();
+        debug_log(1, "WinUsb_ReadPipe failed for breakpoint removal: 0x%08x", err);
+        return err;
+    }
+
+    if (bytes_transferred != 2 || response[0] != 0x00) {
+        debug_log(1, "Breakpoint removal failed at 0x%08x", address);
+        return -1;
+    }
+
+    return 0;
+}
+int STLinkServer::single_step() {
+    debug_log(1, "Performing single-step");
+
+    // Enable single-step mode via DHCSR (Debug Halting Control and Status Register)
+    uint32_t dhcsr_addr = 0xE000EDF0; // Cortex-M DHCSR address
+    uint32_t dhcsr_value = (1 << 0) | (1 << 1); // C_DEBUGEN | C_STEP
+
+    uint8_t cmdbuf[16];
+    cmdbuf[0] = CMD_WRITE_REG;
+    memcpy(&cmdbuf[1], &dhcsr_addr, 4);
+    memcpy(&cmdbuf[5], &dhcsr_value, 4);
+
+    ULONG bytes_transferred;
+    if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, 9, &bytes_transferred, NULL)) {
+        DWORD err = GetLastError();
+        debug_log(1, "WinUsb_WritePipe failed for single-step: 0x%08x", err);
+        return err;
+    }
+
+    // Wait for step completion
+    uint8_t response[2];
+    if (!WinUsb_ReadPipe(winusb_handle, rx_ep, response, 2, &bytes_transferred, NULL)) {
+        DWORD err = GetLastError();
+        debug_log(1, "WinUsb_ReadPipe failed for single-step: 0x%08x", err);
+        return err;
+    }
+
+    if (bytes_transferred != 2 || response[0] != 0x00) {
+        debug_log(1, "Single-step failed");
+        return -1;
+    }
+
+    return 0;
+}
+int STLinkServer::read_all_registers(uint32_t* registers, size_t count) {
+    debug_log(1, "Reading %zu registers", count);
+
+    // Assume Cortex-M has 16 core registers (R0-R15) + special registers (e.g., PSR)
+    if (count < 17) {
+        debug_log(1, "Insufficient buffer size for registers: %zu", count);
+        return -1;
+    }
+
+    // Command to read all registers
+    uint8_t cmdbuf[16];
+    cmdbuf[0] = CMD_READ_ALL_REGS;
+
+    ULONG bytes_transferred;
+    if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, 1, &bytes_transferred, NULL)) {
+        DWORD err = GetLastError();
+        debug_log(1, "WinUsb_WritePipe failed for read registers: 0x%08x", err);
+        return err;
+    }
+
+    // Expect 68 bytes (17 registers * 4 bytes)
+    uint8_t response[68];
+    if (!WinUsb_ReadPipe(winusb_handle, rx_ep, response, 68, &bytes_transferred, NULL)) {
+        DWORD err = GetLastError();
+        debug_log(1, "WinUsb_ReadPipe failed for read registers: 0x%08x", err);
+        return err;
+    }
+
+    if (bytes_transferred != 68) {
+        debug_log(1, "Incomplete register data received: %lu bytes", bytes_transferred);
+        return -1;
+    }
+
+    // Copy response to output buffer
+    for (size_t i = 0; i < 17; i++) {
+        registers[i] = (response[i * 4] << 24) | (response[i * 4 + 1] << 16) |
+            (response[i * 4 + 2] << 8) | response[i * 4 + 3];
+    }
+
+    return 0;
+}
+
+int STLinkServer::halt_target() {
+    debug_log(1, "Halting target");
+    uint8_t cmdbuf[2] = { CMD_HALT, 0x00 };
+    uint8_t response[2];
+    ULONG bytes_transferred;
+
+    if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, sizeof(cmdbuf), &bytes_transferred, NULL) ||
+        !WinUsb_ReadPipe(winusb_handle, rx_ep, response, sizeof(response), &bytes_transferred, NULL)) {
+        debug_log(1, "Halt command failed: 0x%08x", GetLastError());
+        return GetLastError();
+    }
+
+    if (bytes_transferred == 2 && response[0] == 0x00) {
+        target_halted = true;
+        // Read PC at halt
+        uint32_t pc;
+        if (read_register(15, pc) == 0) {
+            halted_pc = pc;
+        }
+        return 0;
+    }
+
+    return -1;
+}
+
+int STLinkServer::continue_execution() {
+    debug_log(1, "Continuing execution");
+    uint8_t cmdbuf[2] = { CMD_CONTINUE, 0x00 };
+    uint8_t response[2];
+    ULONG bytes_transferred;
+
+    if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmdbuf, sizeof(cmdbuf), &bytes_transferred, NULL) ||
+        !WinUsb_ReadPipe(winusb_handle, rx_ep, response, sizeof(response), &bytes_transferred, NULL)) {
+        debug_log(1, "Continue command failed: 0x%08x", GetLastError());
+        return GetLastError();
+    }
+
+    if (bytes_transferred == 2 && response[0] == 0x00) {
+        target_halted = false;
+        return 0;
+    }
+
+    return -1;
+}
+int STLinkServer::debug_write_memory(uint32_t address, uint8_t* data, uint32_t length) {
+    if (target_halted) {
+        return write_memory(address, data, length);
+    }
+    else {
+        int res = halt_target();
+        if (res != 0) return res;
+        res = write_memory(address, data, length);
+        continue_execution();
+        return res;
+    }
+}
+
+int STLinkServer::debug_set_breakpoint(uint32_t address, bool hardware) {
+    if (hardware) {
+        // Use hardware breakpoint
+        uint8_t cmd[5] = { CMD_WRITE_REG };
+        uint32_t value = address | 0x1; // Set breakpoint
+        memcpy(&cmd[1], &value, 4);
+
+        uint8_t response[2];
+        ULONG bytes_transferred;
+        if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmd, sizeof(cmd), &bytes_transferred, NULL) ||
+            !WinUsb_ReadPipe(winusb_handle, rx_ep, response, sizeof(response), &bytes_transferred, NULL)) {
+            return GetLastError();
+        }
+        return (bytes_transferred == 2 && response[0] == 0x00) ? 0 : -1;
+    }
+    else {
+        // Software breakpoint - replace instruction with BKPT
+        uint8_t original[2];
+        int res = read_memory(address, original, 2);
+        if (res != 0) return res;
+
+        uint8_t bkpt[2] = { 0xBE, 0x00 }; // ARM BKPT #0 instruction
+        res = write_memory(address, bkpt, 2);
+        if (res != 0) return res;
+
+        breakpoints[address] = original[0];
+        breakpoints[address + 1] = original[1];
+        return 0;
+    }
+}
+
+int STLinkServer::debug_remove_breakpoint(uint32_t address, bool hardware) {
+    if (hardware) {
+        // Remove hardware breakpoint
+        uint8_t cmd[5] = { CMD_WRITE_REG };
+        uint32_t value = 0; // Clear breakpoint
+        memcpy(&cmd[1], &value, 4);
+
+        uint8_t response[2];
+        ULONG bytes_transferred;
+        if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmd, sizeof(cmd), &bytes_transferred, NULL) ||
+            !WinUsb_ReadPipe(winusb_handle, rx_ep, response, sizeof(response), &bytes_transferred, NULL)) {
+            return GetLastError();
+        }
+        return (bytes_transferred == 2 && response[0] == 0x00) ? 0 : -1;
+    }
+    else {
+        // Restore original instruction
+        auto it1 = breakpoints.find(address);
+        auto it2 = breakpoints.find(address + 1);
+        if (it1 == breakpoints.end() || it2 == breakpoints.end()) {
+            return -1; // Breakpoint not found
+        }
+
+        uint8_t original[2] = { it1->second, it2->second };
+        int res = write_memory(address, original, 2);
+        if (res == 0) {
+            breakpoints.erase(it1);
+            breakpoints.erase(it2);
+        }
+        return res;
+    }
+}
+
+int STLinkServer::debug_step() {
+    if (!target_halted) return 0; // Already running
+
+    uint8_t cmd[2] = { CMD_STEP, 0x00 };
+    uint8_t response[2];
+    ULONG bytes_transferred;
+
+    if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmd, sizeof(cmd), &bytes_transferred, NULL) ||
+        !WinUsb_ReadPipe(winusb_handle, rx_ep, response, sizeof(response), &bytes_transferred, NULL)) {
+        return GetLastError();
+    }
+
+    if (bytes_transferred == 2 && response[0] == 0x00) {
+        // Read PC after step
+        uint32_t pc;
+        if (read_register(15, pc) == 0) {
+            halted_pc = pc;
+        }
+        return 0;
+    }
+    return -1;
+}
+
+int STLinkServer::debug_continue() {
+    if (!target_halted) return 0; // Already running
+
+    uint8_t cmd[2] = { CMD_CONTINUE, 0x00 };
+    uint8_t response[2];
+    ULONG bytes_transferred;
+
+    if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmd, sizeof(cmd), &bytes_transferred, NULL) ||
+        !WinUsb_ReadPipe(winusb_handle, rx_ep, response, sizeof(response), &bytes_transferred, NULL)) {
+        return GetLastError();
+    }
+
+    if (bytes_transferred == 2 && response[0] == 0x00) {
+        target_halted = false;
+        return 0;
+    }
+    return -1;
+}
+
+int STLinkServer::debug_halt() {
+    if (target_halted) return 0; // Already halted
+
+    uint8_t cmd[2] = { CMD_HALT, 0x00 };
+    uint8_t response[2];
+    ULONG bytes_transferred;
+
+    if (!WinUsb_WritePipe(winusb_handle, tx_ep, cmd, sizeof(cmd), &bytes_transferred, NULL) ||
+        !WinUsb_ReadPipe(winusb_handle, rx_ep, response, sizeof(response), &bytes_transferred, NULL)) {
+        return GetLastError();
+    }
+
+    if (bytes_transferred == 2 && response[0] == 0x00) {
+        target_halted = true;
+        // Read PC at halt
+        uint32_t pc;
+        if (read_register(15, pc) == 0) {
+            halted_pc = pc;
+        }
+        return 0;
+    }
+    return -1;
+}
+
+int STLinkServer::debug_read_registers(uint32_t* registers, size_t count) {
+    if (count < 16) return -1; // ARM has 16 core registers
+
+    for (int i = 0; i < 16; i++) {
+        int res = read_register(i, registers[i]);
+        if (res != 0) return res;
+    }
+    return 0;
+}
+
+int STLinkServer::debug_write_register(uint8_t reg_num, uint32_t value) {
+    return write_register(reg_num, value);
+}
+
+int STLinkServer::debug_read_register(uint8_t reg_num, uint32_t* value) {
+    return read_register(reg_num, *value);
+}
 int STLinkServer::start(int debug_level) {
     this->debug_level = debug_level;
     debug_log(1, "Starting STLinkServer with debug level %d", debug_level);

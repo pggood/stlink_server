@@ -4,6 +4,7 @@
 #undef min
 #undef max
 #include "stlink_server.h"
+#include "gdb_server.h"
 #include <iostream>
 #include <string>
 #include <dbt.h>
@@ -130,6 +131,22 @@ string find_latest_gdb_server() {
     return latest_path;
 }
 
+std::vector<uint8_t> load_firmware_file(const std::string& file_path) {
+    std::ifstream file(file_path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        throw std::runtime_error("Failed to open firmware file");
+    }
+
+    std::streamsize size = file.tellg();
+    file.seekg(0, std::ios::beg);
+
+    std::vector<uint8_t> buffer(size);
+    if (!file.read(reinterpret_cast<char*>(buffer.data()), size)) {
+        throw std::runtime_error("Failed to read firmware file");
+    }
+
+    return buffer;
+}
 string get_cubeprogrammer_path(const string& gdb_server_path) {
     log_message("Entering get_cubeprogrammer_path for: " + gdb_server_path);
     try {
@@ -162,6 +179,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     static STLinkServer* server = nullptr;
     static string gdb_server_path;
     static string cubeprogrammer_path;
+    static std::unique_ptr<GDBServer> gdbServer;
 
     log_message("WndProc received message: " + std::to_string(msg) + " (wParam: " + std::to_string(wParam) + ")");
 
@@ -185,20 +203,87 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     if (res != 0) {
                         log_error("Hotplug handling failed", res);
                     }
-                    if (arrived && !gdb_server_path.empty() && !cubeprogrammer_path.empty()) {
-                        string cmd = "\"" + gdb_server_path + "\" -p 61234 -l 1 -d -s -cp \"" + cubeprogrammer_path + "\" -m 0 -k";
-                        log_message("Executing: " + cmd);
 
-                        std::wstring wcmd(cmd.begin(), cmd.end());
-                        STARTUPINFOW si = { sizeof(si) };
-                        PROCESS_INFORMATION pi;
-                        if (CreateProcessW(NULL, wcmd.data(), NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi)) {
-                            CloseHandle(pi.hProcess);
-                            CloseHandle(pi.hThread);
-                            log_message("ST-LINK_gdbserver started successfully");
+                    if (arrived) {
+                        // Start GDB server on port 61234 when device arrives
+                        if (!gdbServer) {
+                            gdbServer = std::make_unique<GDBServer>(61234);
+                            gdbServer->setOnClientConnected([](SOCKET clientSocket) {
+                                log_message("GDB client connected on port 61234");
+                                });
+                            gdbServer->setOnClientDisconnected([](SOCKET clientSocket) {
+                                log_message("GDB client disconnected from port 61234");
+                                });
+                            gdbServer->setOnDataReceived([](SOCKET clientSocket, const std::string& data) {
+                                log_message("GDB command received: " + data);
+                                });
+
+                            if (gdbServer->start()) {
+                                log_message("GDB server started successfully on port 61234");
+                            }
+                            else {
+                                log_error("Failed to start GDB server on port 61234");
+                                gdbServer.reset();
+                            }
                         }
-                        else {
-                            log_error("Failed to execute ST-LINK_gdbserver", GetLastError());
+
+                        // Program firmware when device is connected
+                        try {
+                            auto firmware = load_firmware_file("firmware.bin");
+                            log_message("Firmware loaded successfully, size: " + std::to_string(firmware.size()) + " bytes");
+
+                            // Mass erase first
+                            if (server->mass_erase() == 0) {
+                                log_message("Flash mass erase completed successfully");
+
+                                // Program firmware
+                                if (server->program_firmware(firmware, 0x08000000) == 0) {
+                                    log_message("Firmware programmed successfully");
+
+                                    // Verify firmware
+                                    if (server->verify_firmware(firmware, 0x08000000) == 0) {
+                                        log_message("Firmware verified successfully");
+                                    }
+                                    else {
+                                        log_error("Firmware verification failed");
+                                    }
+                                }
+                                else {
+                                    log_error("Firmware programming failed");
+                                }
+                            }
+                            else {
+                                log_error("Flash mass erase failed");
+                            }
+                        }
+                        catch (const std::exception& e) {
+                            log_error(std::string("Firmware handling error: ") + e.what());
+                        }
+
+                        // Also start the ST-LINK gdbserver if paths are available
+                        if (!gdb_server_path.empty() && !cubeprogrammer_path.empty()) {
+                            string cmd = "\"" + gdb_server_path + "\" -p 61234 -l 1 -d -s -cp \"" + cubeprogrammer_path + "\" -m 0 -k";
+                            log_message("Executing: " + cmd);
+
+                            std::wstring wcmd(cmd.begin(), cmd.end());
+                            STARTUPINFOW si = { sizeof(si) };
+                            PROCESS_INFORMATION pi;
+                            if (CreateProcessW(NULL, wcmd.data(), NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+                                CloseHandle(pi.hProcess);
+                                CloseHandle(pi.hThread);
+                                log_message("ST-LINK_gdbserver started successfully");
+                            }
+                            else {
+                                log_error("Failed to execute ST-LINK_gdbserver", GetLastError());
+                            }
+                        }
+                    }
+                    else {
+                        // Device removed - stop GDB server
+                        if (gdbServer) {
+                            gdbServer->stop();
+                            gdbServer.reset();
+                            log_message("GDB server stopped due to device removal");
                         }
                     }
                 }
@@ -206,21 +291,41 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
         else if (msg == WM_QUIT) {
             log_message("Processing WM_QUIT");
+            // Clean up GDB server before quitting
+            if (gdbServer) {
+                gdbServer->stop();
+                gdbServer.reset();
+            }
             return 0;
         }
         else if (msg == WM_DESTROY) {
             log_message("Processing WM_DESTROY");
+            // Clean up GDB server before destroying window
+            if (gdbServer) {
+                gdbServer->stop();
+                gdbServer.reset();
+            }
             PostQuitMessage(0);
             return 0;
         }
     }
     catch (const std::exception& e) {
         log_error("Exception in WndProc: " + string(e.what()));
+        // Clean up GDB server on exception
+        if (gdbServer) {
+            gdbServer->stop();
+            gdbServer.reset();
+        }
         PostQuitMessage(1);
         return 0;
     }
     catch (...) {
         log_error("Unknown exception in WndProc");
+        // Clean up GDB server on exception
+        if (gdbServer) {
+            gdbServer->stop();
+            gdbServer.reset();
+        }
         PostQuitMessage(1);
         return 0;
     }
